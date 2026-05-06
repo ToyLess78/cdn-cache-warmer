@@ -1,0 +1,19 @@
+{
+  "name": "cdn-cache-warmer",
+  "version": "1.0.0",
+  "description": "CDN cache warming tool — crawls pages and prefetches all assets",
+  "main": "warmer.js",
+  "scripts": {
+    "start": "node warmer.js",
+    "warm": "node warmer.js",
+    "warm:deep": "CRAWL_DEPTH=3 MAX_PAGES=500 node warmer.js",
+    "warm:fast": "CONCURRENT_PAGES=6 CONCURRENT_ASSETS=16 DELAY_PAGES=100 node warmer.js",
+    "warm:verbose": "VERBOSE=true node warmer.js"
+  },
+  "dependencies": {
+    "xml2js": "^0.6.2"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
