@@ -21,7 +21,7 @@ SITE_URL=https://example.com npm start
 | `SITE_URL`          | `https://example.com` | Target website                                   |
 | `CONCURRENT_PAGES`  | `3`                   | Number of pages to warm in parallel              |
 | `CONCURRENT_ASSETS` | `8`                   | Number of assets to load in parallel             |
-| `CRAWL_DEPTH`       | `2`                   | Link crawling depth (0 = sitemap only)           |
+| `CRAWL_DEPTH`       | `2`                   | Link crawling depth (0 = cache-warmup.xml only)  |
 | `MAX_PAGES`         | `200`                 | Maximum number of pages to process               |
 | `DELAY_PAGES`       | `500`                 | Delay between pages (ms)                         |
 | `DELAY_ASSETS`      | `50`                  | Delay between assets (ms)                        |
@@ -77,7 +77,7 @@ docker run --rm \
 
 | Resource type       | How it is discovered                                 |
 |---------------------|------------------------------------------------------|
-| HTML pages          | sitemap.xml → link crawling via `<a href>`           |
+| HTML pages          | cache-warmup.xml → link crawling via `<a href>`      |
 | JavaScript          | `<script src>`, dynamic chunks in HTML               |
 | CSS                 | `<link rel=stylesheet>`                              |
 | Images (eager)      | `<img src>`, `srcset`                                |
@@ -91,7 +91,7 @@ docker run --rm \
 ## How It Works
 
 ```
-1. Get URLs from sitemap.xml (or start from the homepage)
+1. Get URLs from cache-warmup.xml (or start from the homepage)
 2. For each page:
    a. GET the page → expect a 2xx status
    b. Parse HTML → collect assets + internal links

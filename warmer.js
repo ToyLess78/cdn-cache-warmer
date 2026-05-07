@@ -8,8 +8,11 @@
 const https = require('https');
 const http  = require('http');
 const zlib  = require('zlib');
+const fs    = require('fs');
 const { URL } = require('url');
 const { parseStringPromise } = require('xml2js');
+
+loadEnvFile();
 
 // ─── Конфигурация ────────────────────────────────────────────────────────────
 const CONFIG = {
@@ -31,6 +34,13 @@ const CONFIG = {
     preload: true,
   },
   verbose: process.env.VERBOSE === 'true',
+  neon: {
+    databaseUrl: process.env.DATABASE_URL || '',
+    projectId:   process.env.PROJECT_ID || '',
+    apiKey:      process.env.NEON_API_KEY || '',
+    endpointId:  process.env.NEON_ENDPOINT_ID || '',
+    wakeDelay:   parseInt(process.env.NEON_WAKE_DELAY) || 2000,
+  },
 };
 
 // ─── Лог ─────────────────────────────────────────────────────────────────────
@@ -43,6 +53,26 @@ const log = {
 };
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function loadEnvFile(path = '.env') {
+  if (!fs.existsSync(path)) return;
+
+  for (const line of fs.readFileSync(path, 'utf8').split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+
+    const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match) continue;
+
+    const key = match[1];
+    let value = match[2].trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+
+    if (process.env[key] === undefined) process.env[key] = value;
+  }
+}
 
 const stats = {
   pages:  { ok: 0, fail: 0, skip: 0 },
@@ -114,6 +144,117 @@ function fetch(urlStr, options = {}, _redirects = 0) {
     req.on('error', reject);
     req.end();
   });
+}
+
+function neonRequest(path, options = {}) {
+  return new Promise((resolve, reject) => {
+    const reqOptions = {
+      hostname: 'console.neon.tech',
+      port: 443,
+      path: '/api/v2' + path,
+      method: options.method || 'GET',
+      headers: {
+        'Authorization': 'Bearer ' + CONFIG.neon.apiKey,
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+    };
+
+    const req = https.request(reqOptions, (res) => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => {
+        const body = Buffer.concat(chunks).toString('utf8');
+        let json = null;
+        try { json = body ? JSON.parse(body) : null; } catch {}
+
+        if (res.statusCode >= 400) {
+          const message = json && json.message ? json.message : body || ('HTTP ' + res.statusCode);
+          reject(new Error('Neon API ' + res.statusCode + ': ' + message));
+          return;
+        }
+
+        resolve({ status: res.statusCode, body: json });
+      });
+    });
+
+    req.setTimeout(CONFIG.requestTimeout, () => { req.destroy(); reject(new Error('Neon API timeout')); });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+async function fetchNeonEndpoints() {
+  const res = await neonRequest('/projects/' + encodeURIComponent(CONFIG.neon.projectId) + '/endpoints');
+  return res.body && Array.isArray(res.body.endpoints) ? res.body.endpoints : [];
+}
+
+function selectNeonEndpoint(endpoints) {
+  if (CONFIG.neon.endpointId) {
+    return endpoints.find(e => e.id === CONFIG.neon.endpointId);
+  }
+
+  let dbHost = '';
+  try { dbHost = new URL(CONFIG.neon.databaseUrl).hostname; } catch {}
+
+  if (dbHost) {
+    const byHost = endpoints.find(e => e.host === dbHost || e.host === dbHost.replace('-pooler.', '.'));
+    if (byHost) return byHost;
+  }
+
+  return endpoints.length === 1 ? endpoints[0] : null;
+}
+
+function isNeonEndpointAwake(endpoint) {
+  const state = String(endpoint.current_state || endpoint.state || '').toLowerCase();
+  return ['active', 'ready'].includes(state);
+}
+
+async function ensureNeonDatabaseAwake() {
+  const missing = [];
+  if (!CONFIG.neon.projectId) missing.push('PROJECT_ID');
+  if (!CONFIG.neon.apiKey) missing.push('NEON_API_KEY');
+  if (!CONFIG.neon.databaseUrl) missing.push('DATABASE_URL');
+
+  if (missing.length) {
+    throw new Error('Neon check невозможен: missing ' + missing.join(', '));
+  }
+
+  log.info('Проверяю состояние Neon database...');
+  const endpoints = await fetchNeonEndpoints();
+  const endpoint = selectNeonEndpoint(endpoints);
+
+  if (!endpoint) {
+    throw new Error('Не удалось выбрать Neon endpoint. Укажите NEON_ENDPOINT_ID или проверьте DATABASE_URL.');
+  }
+
+  const state = endpoint.current_state || endpoint.state || 'unknown';
+  log.info('Neon endpoint: ' + endpoint.id + ', состояние: ' + state);
+
+  if (isNeonEndpointAwake(endpoint)) {
+    log.success('Neon database уже активна');
+    return;
+  }
+
+  log.info('Neon database спит, отправляю команду start...');
+  await neonRequest(
+      '/projects/' + encodeURIComponent(CONFIG.neon.projectId) +
+      '/endpoints/' + encodeURIComponent(endpoint.id) +
+      '/start',
+      { method: 'POST' }
+  );
+
+  await sleep(CONFIG.neon.wakeDelay);
+
+  const updatedEndpoints = await fetchNeonEndpoints();
+  const updatedEndpoint = selectNeonEndpoint(updatedEndpoints);
+  const updatedState = updatedEndpoint && (updatedEndpoint.current_state || updatedEndpoint.state || 'unknown');
+
+  if (!updatedEndpoint || !isNeonEndpointAwake(updatedEndpoint)) {
+    throw new Error('Neon database не проснулась через ' + CONFIG.neon.wakeDelay + ' мс. Текущее состояние: ' + (updatedState || 'unknown'));
+  }
+
+  log.success('Neon database активна, продолжаю прогрев кеша');
 }
 
 // ─── Парсинг HTML ─────────────────────────────────────────────────────────────
@@ -211,7 +352,7 @@ function isHtmlPage(url) {
   const path = url.split('?')[0];
   const ext  = path.split('.').pop().toLowerCase();
   return !['js','css','png','jpg','jpeg','gif','webp','svg','avif','woff','woff2',
-    'ttf','otf','eot','ico','pdf','zip','xml','json','map'].includes(ext);
+    'ttf','otf','eot','ico','pdf','zip','xml','json','map','webmanifest'].includes(ext);
 }
 
 // ─── Параллельная очередь ────────────────────────────────────────────────────
@@ -289,20 +430,17 @@ async function warmPage(pageUrl, depth = 0) {
   }
 }
 
-// ─── Sitemap ─────────────────────────────────────────────────────────────────
-async function fetchSitemapUrls(baseUrl) {
+// ─── Warmup XML ──────────────────────────────────────────────────────────────
+async function fetchWarmupUrls(baseUrl) {
   const candidates = [
-    baseUrl + '/sitemap.xml',
-    baseUrl + '/sitemap_index.xml',
-    baseUrl + '/sitemap/sitemap.xml',
-    baseUrl + '/sitemaps/sitemap.xml',
+    baseUrl + '/cache-warmup.xml',
   ];
 
   for (const url of candidates) {
     try {
-      log.info('Проверяю sitemap: ' + url);
+      log.info('Проверяю cache warmup XML: ' + url);
       const res = await fetch(url, { accept: 'application/xml,text/xml,*/*' });
-      log.debug('Sitemap статус: ' + res.status + ', content-type: ' + res.headers['content-type']);
+      log.debug('Cache warmup XML статус: ' + res.status + ', content-type: ' + res.headers['content-type']);
 
       if (res.status !== 200) { log.debug('Пропуск: статус ' + res.status); continue; }
 
@@ -317,18 +455,18 @@ async function fetchSitemapUrls(baseUrl) {
 
       if (parsed.sitemapindex) {
         const smaps = parsed.sitemapindex.sitemap || [];
-        log.info('Sitemap index: ' + smaps.length + ' дочерних карт');
+        log.info('Cache warmup XML index: ' + smaps.length + ' дочерних карт');
         for (const sm of smaps) {
           const smUrl = sm.loc && sm.loc[0];
           if (!smUrl) continue;
           try {
-            log.debug('Загружаю дочерний sitemap: ' + smUrl);
+            log.debug('Загружаю дочерний cache warmup XML: ' + smUrl);
             const r2 = await fetch(smUrl, { accept: 'application/xml,*/*' });
             const p2 = await parseStringPromise(r2.body, { explicitArray: true });
             for (const u of (p2.urlset && p2.urlset.url || [])) {
               if (u.loc && u.loc[0]) urls.add(u.loc[0]);
             }
-          } catch (e) { log.debug('Дочерний sitemap ERR: ' + e.message); }
+          } catch (e) { log.debug('Дочерний cache warmup XML ERR: ' + e.message); }
         }
       }
 
@@ -337,16 +475,16 @@ async function fetchSitemapUrls(baseUrl) {
       }
 
       if (urls.size > 0) {
-        log.success('Sitemap: найдено ' + urls.size + ' URL');
+        log.success('Cache warmup XML: найдено ' + urls.size + ' URL');
         return [...urls];
       }
-      log.warn('Sitemap пустой: ' + url);
+      log.warn('Cache warmup XML пустой: ' + url);
     } catch (e) {
-      log.debug('Sitemap ERR: ' + url + ' — ' + e.message);
+      log.debug('Cache warmup XML ERR: ' + url + ' — ' + e.message);
     }
   }
 
-  log.warn('Sitemap не найден, стартуем с главной страницы');
+  log.warn('Cache warmup XML не найден, стартуем с главной страницы');
   return [baseUrl];
 }
 
@@ -391,8 +529,10 @@ function printReport() {
   log.info('Глубина: ' + CONFIG.crawlDepth + ',  макс. страниц: ' + CONFIG.maxPages + '\n');
 
   try {
+    await ensureNeonDatabaseAwake();
+
     const base    = new URL(CONFIG.baseUrl);
-    const allUrls = await fetchSitemapUrls(CONFIG.baseUrl);
+    const allUrls = await fetchWarmupUrls(CONFIG.baseUrl);
     const filtered = allUrls.filter(u => {
       try { return new URL(u).hostname === base.hostname && isHtmlPage(u); } catch { return false; }
     });
