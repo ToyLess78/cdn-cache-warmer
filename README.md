@@ -1,6 +1,6 @@
 # 🔥 CDN Cache Warmer
 
-A CDN cache warming tool. It crawls site pages and force-loads all assets:
+A CDN cache warming tool. It reads pages from `cache-warmup.xml` and force-loads all assets:
 **JavaScript files, CSS, images (including lazy-loaded images), fonts, and preload resources**.
 
 ---
@@ -21,11 +21,15 @@ SITE_URL=https://example.com npm start
 | `SITE_URL`          | `https://example.com` | Target website                                   |
 | `CONCURRENT_PAGES`  | `3`                   | Number of pages to warm in parallel              |
 | `CONCURRENT_ASSETS` | `8`                   | Number of assets to load in parallel             |
-| `CRAWL_DEPTH`       | `2`                   | Link crawling depth (0 = cache-warmup.xml only)  |
 | `MAX_PAGES`         | `200`                 | Maximum number of pages to process               |
 | `DELAY_PAGES`       | `500`                 | Delay between pages (ms)                         |
 | `DELAY_ASSETS`      | `50`                  | Delay between assets (ms)                        |
 | `REQUEST_TIMEOUT`   | `15000`               | HTTP request timeout (ms)                        |
+| `WARM_MOBILE_HTML`  | `true`                | Also parse pages as a mobile browser             |
+| `BROWSER_WARM`      | `true`                | Open pages in a browser, scroll, and warm lazy-loaded images |
+| `BROWSER_SCROLL_STEP` | `700`               | Browser scroll step size (px)                    |
+| `BROWSER_SCROLL_DELAY` | `300`              | Delay after each browser scroll step (ms)        |
+| `BROWSER_MAX_SCROLLS` | `80`                | Maximum number of browser scroll steps           |
 | `VERBOSE`           | `false`               | Detailed log output for every asset              |
 
 ---
@@ -36,8 +40,8 @@ SITE_URL=https://example.com npm start
 # Standard cache warmup
 SITE_URL=https://my-site.com npm start
 
-# Deep warmup (3 levels, up to 500 pages)
-SITE_URL=https://my-site.com npm run warm:deep
+# Large URL list from cache-warmup.xml (up to 500 pages)
+SITE_URL=https://my-site.com npm run warm:large
 
 # Fast warmup (maximum parallelism)
 SITE_URL=https://my-site.com npm run warm:fast
@@ -58,7 +62,6 @@ docker build -t cdn-warmer .
 docker run --rm \
   -e SITE_URL=https://your-site.com \
   -e CONCURRENT_PAGES=5 \
-  -e CRAWL_DEPTH=3 \
   cdn-warmer
 ```
 
@@ -77,7 +80,7 @@ docker run --rm \
 
 | Resource type       | How it is discovered                                 |
 |---------------------|------------------------------------------------------|
-| HTML pages          | cache-warmup.xml → link crawling via `<a href>`      |
+| HTML pages          | `cache-warmup.xml`                                   |
 | JavaScript          | `<script src>`, dynamic chunks in HTML               |
 | CSS                 | `<link rel=stylesheet>`                              |
 | Images (eager)      | `<img src>`, `srcset`                                |
@@ -94,9 +97,9 @@ docker run --rm \
 1. Get URLs from cache-warmup.xml (or start from the homepage)
 2. For each page:
    a. GET the page → expect a 2xx status
-   b. Parse HTML → collect assets + internal links
+   b. Parse HTML → collect assets
    c. Load all assets in parallel
    d. For each CSS file → extract and load fonts
-3. Add discovered links to the queue (up to CRAWL_DEPTH)
+3. Open the page in a browser → scroll → warm lazy-loaded images
 4. Print the final report
 ```

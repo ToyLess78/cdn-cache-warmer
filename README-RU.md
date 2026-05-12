@@ -1,6 +1,6 @@
 # 🔥 CDN Cache Warmer
 
-Инструмент для прогрева CDN кеша. Краулит страницы сайта и принудительно загружает все ассеты:
+Инструмент для прогрева CDN кеша. Берёт страницы из `cache-warmup.xml` и принудительно загружает все ассеты:
 **JS-скрипты, CSS, изображения (включая lazy-load), шрифты, preload-ресурсы**.
 
 ---
@@ -21,11 +21,15 @@ SITE_URL=https://example.com npm start
 | `SITE_URL`          | `https://example.com` | Целевой сайт                                     |
 | `CONCURRENT_PAGES`  | `3`                   | Сколько страниц прогревать параллельно           |
 | `CONCURRENT_ASSETS` | `8`                   | Сколько ассетов загружать параллельно            |
-| `CRAWL_DEPTH`       | `2`                   | Глубина краулинга ссылок (0 = только cache-warmup.xml) |
 | `MAX_PAGES`         | `200`                 | Максимум страниц для обработки                  |
 | `DELAY_PAGES`       | `500`                 | Пауза между страницами (мс)                     |
 | `DELAY_ASSETS`      | `50`                  | Пауза между ассетами (мс)                       |
 | `REQUEST_TIMEOUT`   | `15000`               | Таймаут HTTP-запроса (мс)                        |
+| `WARM_MOBILE_HTML`  | `true`                | Дополнительно парсить страницы как мобильный браузер |
+| `BROWSER_WARM`      | `true`                | Открывать страницы в браузере, скроллить и прогревать lazy-load изображения |
+| `BROWSER_SCROLL_STEP` | `700`               | Размер шага прокрутки страницы в браузере (px)  |
+| `BROWSER_SCROLL_DELAY` | `300`              | Пауза после каждого шага прокрутки (мс)         |
+| `BROWSER_MAX_SCROLLS` | `80`                | Максимальное количество шагов прокрутки          |
 | `VERBOSE`           | `false`               | Подробный лог каждого ассета                    |
 
 ---
@@ -36,8 +40,8 @@ SITE_URL=https://example.com npm start
 # Стандартный прогрев
 SITE_URL=https://my-site.com npm start
 
-# Глубокий (3 уровня, до 500 страниц)
-SITE_URL=https://my-site.com npm run warm:deep
+# Большой список URL из cache-warmup.xml (до 500 страниц)
+SITE_URL=https://my-site.com npm run warm:large
 
 # Быстрый (максимальная параллельность)
 SITE_URL=https://my-site.com npm run warm:fast
@@ -58,7 +62,6 @@ docker build -t cdn-warmer .
 docker run --rm \
   -e SITE_URL=https://your-site.com \
   -e CONCURRENT_PAGES=5 \
-  -e CRAWL_DEPTH=3 \
   cdn-warmer
 ```
 
@@ -77,7 +80,7 @@ docker run --rm \
 
 | Тип ресурса         | Как находится                                        |
 |---------------------|------------------------------------------------------|
-| HTML-страницы       | cache-warmup.xml → краулинг ссылок `<a href>`        |
+| HTML-страницы       | `cache-warmup.xml`                                   |
 | JavaScript          | `<script src>`, динамические чанки в HTML            |
 | CSS                 | `<link rel=stylesheet>`                              |
 | Изображения (eager) | `<img src>`, `srcset`                                |
@@ -94,9 +97,9 @@ docker run --rm \
 1. Получить URL из cache-warmup.xml (или стартовать с главной)
 2. Для каждой страницы:
    a. GET страницы → статус 2xx
-   b. Парсинг HTML → список ассетов + внутренние ссылки
+   b. Парсинг HTML → список ассетов
    c. Параллельная загрузка всех ассетов
    d. Для каждого CSS → извлечение и загрузка шрифтов
-3. Найденные ссылки добавляются в очередь (до CRAWL_DEPTH)
+3. Открытие страницы в браузере → прокрутка → прогрев lazy-load изображений
 4. Итоговый отчёт
 ```

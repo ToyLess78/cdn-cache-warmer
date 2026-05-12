@@ -2,7 +2,7 @@
 
 /**
  * CDN Cache Warmer
- * Прогрев CDN кеша: краулинг страниц, загрузка всех ассетов (JS, CSS, изображения, шрифты)
+ * Прогрев CDN кеша: загрузка страниц из cache-warmup.xml и всех ассетов (JS, CSS, изображения, шрифты)
  */
 
 const https = require('https');
@@ -22,10 +22,15 @@ const CONFIG = {
   delayBetweenPages:  parseInt(process.env.DELAY_PAGES)  || 500,
   delayBetweenAssets: parseInt(process.env.DELAY_ASSETS) || 50,
   requestTimeout:   parseInt(process.env.REQUEST_TIMEOUT) || 15000,
-  crawlDepth:       parseInt(process.env.CRAWL_DEPTH) || 2,
   maxPages:         parseInt(process.env.MAX_PAGES)   || 200,
   maxRedirects:     5,
   userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  mobileUserAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+  warmMobileHtml: process.env.WARM_MOBILE_HTML !== 'false',
+  browserWarm: process.env.BROWSER_WARM !== 'false',
+  browserScrollStep: parseInt(process.env.BROWSER_SCROLL_STEP) || 700,
+  browserScrollDelay: parseInt(process.env.BROWSER_SCROLL_DELAY) || 300,
+  browserMaxScrolls: parseInt(process.env.BROWSER_MAX_SCROLLS) || 80,
   warmAssetTypes: {
     scripts: true,
     styles:  true,
@@ -54,6 +59,14 @@ const log = {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+function loadPlaywright() {
+  try {
+    return require('playwright');
+  } catch {
+    return null;
+  }
+}
+
 function loadEnvFile(path = '.env') {
   if (!fs.existsSync(path)) return;
 
@@ -81,6 +94,10 @@ const stats = {
   startTime: Date.now(),
 };
 
+let browserInstancePromise = null;
+const warmedAssets = new Set();
+const announcedImages = new Set();
+
 // ─── HTTP fetch c gzip + redirect ────────────────────────────────────────────
 function fetch(urlStr, options = {}, _redirects = 0) {
   return new Promise((resolve, reject) => {
@@ -100,7 +117,6 @@ function fetch(urlStr, options = {}, _redirects = 0) {
         'Accept-Language': 'uk,ru;q=0.9,en;q=0.8',
         'Accept-Encoding': 'gzip, deflate, br',
         'Connection':      'keep-alive',
-        'Cache-Control':   'no-cache',
         ...options.headers,
       },
     };
@@ -261,7 +277,6 @@ async function ensureNeonDatabaseAwake() {
 function extractFromHtml(html, pageUrl) {
   const base   = new URL(pageUrl);
   const assets = new Set();
-  const links  = new Set();
 
   // Декодируем HTML-сущности в URL (&amp; → &, &lt; → < и т.д.)
   const decodeEntities = (str) => str
@@ -279,12 +294,6 @@ function extractFromHtml(html, pageUrl) {
         href.startsWith('mailto:') || href.startsWith('#')) return null;
     try { return new URL(href, base).href; } catch { return null; }
   };
-
-  // ── Внутренние ссылки ──────────────────────────────────────────────────────
-  for (const m of html.matchAll(/href=["']([^"'#][^"']*)["']/gi)) {
-    const url = resolve(m[1]);
-    if (url && isSameDomain(url, base)) links.add(url.split('#')[0].split('?')[0]);
-  }
 
   // ── Scripts ────────────────────────────────────────────────────────────────
   if (CONFIG.warmAssetTypes.scripts) {
@@ -328,9 +337,18 @@ function extractFromHtml(html, pageUrl) {
       assets.add(resolve(m[1]));
   }
 
+  const expandedAssets = new Set([...assets].filter(Boolean));
+  for (const assetUrl of expandedAssets) {
+    try {
+      const parsed = new URL(assetUrl);
+      if (parsed.pathname === '/_next/image' && parsed.searchParams.has('url')) {
+        expandedAssets.add(new URL(parsed.searchParams.get('url'), base).href);
+      }
+    } catch {}
+  }
+
   return {
-    assets: [...assets].filter(Boolean),
-    links:  [...links].filter(Boolean),
+    assets: [...expandedAssets],
   };
 }
 
@@ -344,8 +362,164 @@ function extractFontsFromCss(css, cssUrl) {
   return [...fonts];
 }
 
-function isSameDomain(url, base) {
-  try { return new URL(url).hostname === base.hostname; } catch { return false; }
+function getAssetAccept(url) {
+  const lower = url.split('?')[0].toLowerCase();
+
+  if (isImageAsset(url)) {
+    return 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8';
+  }
+
+  if (/\.css$/.test(lower)) {
+    return 'text/css,*/*;q=0.1';
+  }
+
+  if (/\.js$/.test(lower)) {
+    return '*/*';
+  }
+
+  if (/\.(?:woff2?|ttf|otf|eot)$/.test(lower)) {
+    return '*/*';
+  }
+
+  return '*/*';
+}
+
+function isImageAsset(url) {
+  const lower = url.split('?')[0].toLowerCase();
+  return lower.includes('/_next/image') || /\.(?:jpe?g|png|webp|gif|svg|avif|ico)$/.test(lower);
+}
+
+function getAssetWarmRequests(url) {
+  if (!isImageAsset(url)) {
+    return [{ accept: getAssetAccept(url) }];
+  }
+
+  return [
+    {
+      accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+      headers: { 'User-Agent': CONFIG.userAgent },
+    },
+    {
+      accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+      headers: { 'User-Agent': 'Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36' },
+    },
+    {
+      accept: 'image/webp,image/*,*/*;q=0.8',
+      headers: { 'User-Agent': CONFIG.mobileUserAgent },
+    },
+  ];
+}
+
+async function collectBrowserAssets(pageUrl, userAgent) {
+  if (!CONFIG.browserWarm || !CONFIG.warmAssetTypes.images) return [];
+
+  const playwright = loadPlaywright();
+  if (!playwright) {
+    log.warn('Browser warm skipped: install playwright to trigger lazy-loaded images');
+    return [];
+  }
+
+  if (!browserInstancePromise) {
+    browserInstancePromise = playwright.chromium.launch({
+      headless: true,
+      executablePath: playwright.chromium.executablePath(),
+    }).catch((e) => {
+      browserInstancePromise = null;
+      throw e;
+    });
+  }
+
+  const browser = await browserInstancePromise;
+  const context = await browser.newContext({
+    userAgent,
+    viewport: userAgent === CONFIG.mobileUserAgent
+        ? { width: 390, height: 844, isMobile: true }
+        : { width: 1440, height: 1200 },
+  });
+  const page = await context.newPage();
+
+  const requestedImages = new Set();
+  page.on('requestfinished', (request) => {
+    if (request.resourceType() === 'image') requestedImages.add(request.url());
+  });
+
+  try {
+    await page.goto(pageUrl, { waitUntil: 'networkidle', timeout: CONFIG.requestTimeout });
+
+    let previousY = -1;
+    for (let i = 0; i < CONFIG.browserMaxScrolls; i++) {
+      const currentY = await page.evaluate((step) => {
+        window.scrollBy(0, step);
+        return window.scrollY;
+      }, CONFIG.browserScrollStep);
+      await page.waitForTimeout(CONFIG.browserScrollDelay);
+      if (currentY === previousY) break;
+      previousY = currentY;
+    }
+
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForLoadState('networkidle', { timeout: CONFIG.requestTimeout }).catch(() => {});
+
+    const browserUrls = await page.evaluate(() => {
+      const urls = new Set();
+
+      for (const img of document.images) {
+        if (img.currentSrc) urls.add(img.currentSrc);
+        if (img.src) urls.add(img.src);
+        if (img.srcset) {
+          for (const candidate of img.srcset.split(',')) {
+            const src = candidate.trim().split(/\s+/)[0];
+            if (src) urls.add(src);
+          }
+        }
+      }
+
+      for (const source of document.querySelectorAll('source[srcset]')) {
+        for (const candidate of source.srcset.split(',')) {
+          const src = candidate.trim().split(/\s+/)[0];
+          if (src) urls.add(src);
+        }
+      }
+
+      for (const element of document.querySelectorAll('*')) {
+        const bg = getComputedStyle(element).backgroundImage;
+        if (!bg || bg === 'none') continue;
+        for (const match of bg.matchAll(/url\(["']?([^"')]+)["']?\)/g)) {
+          if (match[1] && !match[1].startsWith('data:')) urls.add(match[1]);
+        }
+      }
+
+      for (const entry of performance.getEntriesByType('resource')) {
+        if (entry.initiatorType === 'img' || /\.(?:jpe?g|png|webp|gif|svg|avif|ico)(?:\?|$)/i.test(entry.name)) {
+          urls.add(entry.name);
+        }
+      }
+
+      return [...urls];
+    });
+
+    const normalized = new Set([...requestedImages]);
+    browserUrls.forEach((url) => {
+      try { normalized.add(new URL(url, pageUrl).href); } catch {}
+    });
+
+    return [...normalized].filter(url => !url.startsWith('data:'));
+  } finally {
+    await context.close();
+  }
+}
+
+async function closeBrowser() {
+  if (!browserInstancePromise) return;
+
+  try {
+    const browser = await browserInstancePromise;
+    await browser.close();
+  } catch (e) {
+    log.debug('Browser close skipped: ' + e.message);
+  } finally {
+    browserInstancePromise = null;
+  }
 }
 
 function isHtmlPage(url) {
@@ -369,31 +543,58 @@ async function runQueue(items, concurrency, fn) {
 
 // ─── Прогрев одного ассета ───────────────────────────────────────────────────
 async function warmAsset(url) {
-  try {
-    const res = await fetch(url, { accept: '*/*' });
-    if (res.status >= 400) {
-      log.warn('Asset ' + res.status + ' ' + url);
-      stats.assets.fail++;
-    } else {
-      log.debug('Asset ' + res.status + ' ' + url);
-      stats.assets.ok++;
-      if (CONFIG.warmAssetTypes.fonts && /\.css(\?|$)/.test(url)) {
-        const fonts = extractFontsFromCss(res.body, url);
-        if (fonts.length) log.debug('Fonts from CSS: ' + fonts.length);
-        for (const f of fonts) await warmAsset(f);
+  if (warmedAssets.has(url)) {
+    stats.assets.skip++;
+    log.debug('Asset SKIP duplicate ' + url);
+    return;
+  }
+
+  warmedAssets.add(url);
+
+  for (const requestOptions of getAssetWarmRequests(url)) {
+    try {
+      const res = await fetch(url, requestOptions);
+      if (res.status >= 400) {
+        log.warn('Asset ' + res.status + ' ' + url);
+        stats.assets.fail++;
+      } else {
+        log.debug('Asset ' + res.status + ' ' + url + ' [' + requestOptions.accept + ']');
+        stats.assets.ok++;
+        if (CONFIG.warmAssetTypes.fonts && /\.css(\?|$)/.test(url)) {
+          const fonts = extractFontsFromCss(res.body, url);
+          if (fonts.length) log.debug('Fonts from CSS: ' + fonts.length);
+          for (const f of fonts) await warmAsset(f);
+        }
       }
+    } catch (e) {
+      log.debug('Asset ERR ' + url + ' — ' + e.message);
+      stats.assets.fail++;
     }
-  } catch (e) {
-    log.debug('Asset ERR ' + url + ' — ' + e.message);
-    stats.assets.fail++;
   }
   await sleep(CONFIG.delayBetweenAssets);
 }
 
-// ─── Краулер ─────────────────────────────────────────────────────────────────
+function logPageImages(pageUrl, assets) {
+  const images = [...assets].filter(url =>
+      isImageAsset(url) && !warmedAssets.has(url) && !announcedImages.has(url)
+  );
+
+  if (!images.length) {
+    log.info('Изображения: новых URL нет');
+    return;
+  }
+
+  log.info('Изображения для прогрева: ' + images.length + ' (' + pageUrl + ')');
+  images.forEach((url, index) => {
+    announcedImages.add(url);
+    console.log('  IMG ' + String(index + 1).padStart(3, ' ') + ' ' + url);
+  });
+}
+
+// ─── Прогрев страниц ─────────────────────────────────────────────────────────
 const visited = new Set();
 
-async function warmPage(pageUrl, depth = 0) {
+async function warmPage(pageUrl) {
   const cleanUrl = pageUrl.split('#')[0];
   if (visited.has(cleanUrl))            { stats.pages.skip++; return []; }
   if (visited.size >= CONFIG.maxPages)  { stats.pages.skip++; return []; }
@@ -416,13 +617,50 @@ async function warmPage(pageUrl, depth = 0) {
       return [];
     }
 
-    const { assets, links } = extractFromHtml(res.body, cleanUrl);
-    log.success('OK [' + res.status + '] — ассеты: ' + assets.length + ', ссылки: ' + links.length);
+    const assets = new Set();
+    const extracted = extractFromHtml(res.body, cleanUrl);
+    extracted.assets.forEach(a => assets.add(a));
+
+    if (CONFIG.warmMobileHtml) {
+      try {
+        const mobileRes = await fetch(cleanUrl, {
+          headers: { 'User-Agent': CONFIG.mobileUserAgent },
+        });
+        const mobileCt = mobileRes.headers['content-type'] || '';
+        if (mobileRes.status < 400 && (mobileCt.includes('html') || mobileCt.includes('xml'))) {
+          const mobileExtracted = extractFromHtml(mobileRes.body, cleanUrl);
+          mobileExtracted.assets.forEach(a => assets.add(a));
+        }
+      } catch (e) {
+        log.debug('Mobile HTML ERR ' + cleanUrl + ' — ' + e.message);
+      }
+    }
+
+    try {
+      const browserAssets = await collectBrowserAssets(cleanUrl, CONFIG.userAgent);
+      browserAssets.forEach(a => assets.add(a));
+      if (browserAssets.length) log.debug('Browser assets: ' + browserAssets.length);
+    } catch (e) {
+      log.warn('Browser warm ERR ' + cleanUrl + ' — ' + e.message);
+    }
+
+    if (CONFIG.warmMobileHtml) {
+      try {
+        const mobileBrowserAssets = await collectBrowserAssets(cleanUrl, CONFIG.mobileUserAgent);
+        mobileBrowserAssets.forEach(a => assets.add(a));
+        if (mobileBrowserAssets.length) log.debug('Mobile browser assets: ' + mobileBrowserAssets.length);
+      } catch (e) {
+        log.warn('Mobile browser warm ERR ' + cleanUrl + ' — ' + e.message);
+      }
+    }
+
+    log.success('OK [' + res.status + '] — ассеты: ' + assets.size);
+    logPageImages(cleanUrl, assets);
     stats.pages.ok++;
 
-    await runQueue(assets, CONFIG.concurrentAssets, warmAsset);
+    await runQueue([...assets], CONFIG.concurrentAssets, warmAsset);
     await sleep(CONFIG.delayBetweenPages);
-    return depth < CONFIG.crawlDepth ? links : [];
+    return [];
   } catch (e) {
     log.error('Страница ERR ' + cleanUrl + ' — ' + e.message);
     stats.pages.fail++;
@@ -488,23 +726,11 @@ async function fetchWarmupUrls(baseUrl) {
   return [baseUrl];
 }
 
-// ─── Краулинг ────────────────────────────────────────────────────────────────
-async function crawl(startUrls) {
-  let frontier = [...new Set(startUrls)];
-  let depth = 0;
-
-  while (frontier.length > 0 && visited.size < CONFIG.maxPages && depth <= CONFIG.crawlDepth) {
-    log.info('\n--- Глубина ' + depth + ': ' + frontier.length + ' страниц в очереди ---');
-    const nextLinks = new Set();
-
-    await runQueue(frontier, CONFIG.concurrentPages, async (url) => {
-      const links = await warmPage(url, depth);
-      links.forEach(l => { if (!visited.has(l) && isHtmlPage(l)) nextLinks.add(l); });
-    });
-
-    frontier = [...nextLinks].filter(u => !visited.has(u));
-    depth++;
-  }
+// ─── Очередь страниц из cache-warmup.xml ────────────────────────────────────
+async function warmPages(startUrls) {
+  const urls = [...new Set(startUrls)].slice(0, CONFIG.maxPages);
+  log.info('\n--- Страниц в очереди из cache-warmup.xml: ' + urls.length + ' ---');
+  await runQueue(urls, CONFIG.concurrentPages, warmPage);
 }
 
 // ─── Финальный отчёт ─────────────────────────────────────────────────────────
@@ -526,7 +752,7 @@ function printReport() {
   console.log('\n CDN Cache Warmer\n');
   log.info('Сайт:          ' + CONFIG.baseUrl);
   log.info('Параллельность: ' + CONFIG.concurrentPages + ' страниц / ' + CONFIG.concurrentAssets + ' ассетов');
-  log.info('Глубина: ' + CONFIG.crawlDepth + ',  макс. страниц: ' + CONFIG.maxPages + '\n');
+  log.info('Макс. страниц из XML: ' + CONFIG.maxPages + '\n');
 
   try {
     await ensureNeonDatabaseAwake();
@@ -536,10 +762,11 @@ function printReport() {
     const filtered = allUrls.filter(u => {
       try { return new URL(u).hostname === base.hostname && isHtmlPage(u); } catch { return false; }
     });
-    await crawl(filtered.length ? filtered : [CONFIG.baseUrl]);
+    await warmPages(filtered.length ? filtered : [CONFIG.baseUrl]);
   } catch (e) {
     log.error('Критическая ошибка: ' + e.message);
   } finally {
+    await closeBrowser();
     printReport();
   }
 })();
