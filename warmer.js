@@ -31,6 +31,10 @@ const CONFIG = {
   browserScrollStep: parseInt(process.env.BROWSER_SCROLL_STEP) || 700,
   browserScrollDelay: parseInt(process.env.BROWSER_SCROLL_DELAY) || 300,
   browserMaxScrolls: parseInt(process.env.BROWSER_MAX_SCROLLS) || 80,
+  nextImageMobileWidths: (process.env.NEXT_IMAGE_MOBILE_WIDTHS || '384,576,640,750,1080,1200')
+      .split(',')
+      .map(v => parseInt(v.trim(), 10))
+      .filter(Boolean),
   warmAssetTypes: {
     scripts: true,
     styles:  true,
@@ -338,18 +342,37 @@ function extractFromHtml(html, pageUrl) {
   }
 
   const expandedAssets = new Set([...assets].filter(Boolean));
-  for (const assetUrl of expandedAssets) {
-    try {
-      const parsed = new URL(assetUrl);
-      if (parsed.pathname === '/_next/image' && parsed.searchParams.has('url')) {
-        expandedAssets.add(new URL(parsed.searchParams.get('url'), base).href);
-      }
-    } catch {}
-  }
+  expandNextImageAssets(expandedAssets, base);
 
   return {
     assets: [...expandedAssets],
   };
+}
+
+function expandNextImageAssets(assets, base) {
+  const mobileWidths = new Set(CONFIG.nextImageMobileWidths.map(String));
+
+  for (const assetUrl of [...assets]) {
+    try {
+      const parsed = new URL(assetUrl, base);
+      if (parsed.pathname !== '/_next/image' || !parsed.searchParams.has('url')) continue;
+
+      const sourceUrl = parsed.searchParams.get('url');
+      const quality = parsed.searchParams.get('q') || '75';
+
+      // Do not warm every width from srcset. Keep only the configured mobile sizes.
+      assets.delete(assetUrl);
+      assets.add(new URL(sourceUrl, base).href);
+
+      for (const width of mobileWidths) {
+        const nextImageUrl = new URL(parsed.pathname, base);
+        nextImageUrl.searchParams.set('url', sourceUrl);
+        nextImageUrl.searchParams.set('w', width);
+        nextImageUrl.searchParams.set('q', quality);
+        assets.add(nextImageUrl.href);
+      }
+    } catch {}
+  }
 }
 
 // Шрифты из CSS
@@ -386,12 +409,33 @@ function getAssetAccept(url) {
 
 function isImageAsset(url) {
   const lower = url.split('?')[0].toLowerCase();
-  return lower.includes('/_next/image') || /\.(?:jpe?g|png|webp|gif|svg|avif|ico)$/.test(lower);
+  return isNextImageAsset(url) || /\.(?:jpe?g|png|webp|gif|svg|avif|ico)$/.test(lower);
+}
+
+function isNextImageAsset(url) {
+  try {
+    return new URL(url).pathname === '/_next/image';
+  } catch {
+    return url.split('?')[0].toLowerCase().includes('/_next/image');
+  }
 }
 
 function getAssetWarmRequests(url) {
   if (!isImageAsset(url)) {
     return [{ accept: getAssetAccept(url) }];
+  }
+
+  if (isNextImageAsset(url)) {
+    return [
+      {
+        accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        headers: { 'User-Agent': 'Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36' },
+      },
+      {
+        accept: 'image/webp,image/*,*/*;q=0.8',
+        headers: { 'User-Agent': CONFIG.mobileUserAgent },
+      },
+    ];
   }
 
   return [
@@ -578,13 +622,14 @@ function logPageImages(pageUrl, assets) {
   const images = [...assets].filter(url =>
       isImageAsset(url) && !warmedAssets.has(url) && !announcedImages.has(url)
   );
+  const nextMobileImages = images.filter(isNextImageAsset);
 
   if (!images.length) {
     log.info('Изображения: новых URL нет');
     return;
   }
 
-  log.info('Изображения для прогрева: ' + images.length + ' (' + pageUrl + ')');
+  log.info('Изображения для прогрева: ' + images.length + ', Next mobile: ' + nextMobileImages.length + ' (' + pageUrl + ')');
   images.forEach((url, index) => {
     announcedImages.add(url);
     console.log('  IMG ' + String(index + 1).padStart(3, ' ') + ' ' + url);
@@ -653,6 +698,8 @@ async function warmPage(pageUrl) {
         log.warn('Mobile browser warm ERR ' + cleanUrl + ' — ' + e.message);
       }
     }
+
+    expandNextImageAssets(assets, new URL(cleanUrl));
 
     log.success('OK [' + res.status + '] — ассеты: ' + assets.size);
     logPageImages(cleanUrl, assets);

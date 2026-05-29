@@ -30,6 +30,7 @@ SITE_URL=https://example.com npm start
 | `BROWSER_SCROLL_STEP` | `700`               | Browser scroll step size (px)                    |
 | `BROWSER_SCROLL_DELAY` | `300`              | Delay after each browser scroll step (ms)        |
 | `BROWSER_MAX_SCROLLS` | `80`                | Maximum number of browser scroll steps           |
+| `NEXT_IMAGE_MOBILE_WIDTHS` | `384,576,640,750,1080,1200` | Only these `/_next/image` widths are force-generated with GET requests |
 | `VERBOSE`           | `false`               | Detailed log output for every asset              |
 
 ---
