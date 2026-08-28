@@ -598,6 +598,16 @@ async function warmAsset(url) {
   for (const requestOptions of getAssetWarmRequests(url)) {
     try {
       const res = await fetch(url, requestOptions);
+      const cache = res.headers['x-vercel-cache'] || '-';
+
+      if (isNextImageAsset(url)) {
+        console.log(
+            '[NEXT IMAGE]',
+            cache,
+            res.headers['content-type'],
+            url
+        );
+      }
       if (res.status >= 400) {
         log.warn('Asset ' + res.status + ' ' + url);
         stats.assets.fail++;
